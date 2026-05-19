@@ -14,6 +14,7 @@ import { buildSystemPrompt } from './system-prompt';
 
 const PARTICIPANT_ID = 'aiEngineerCoach.aicoach';
 const MAX_TOOL_ROUNDS = 8;
+const MAX_HISTORY_CHARS = 12_000;
 
 /* ---- slash commands ---- */
 
@@ -41,18 +42,70 @@ function getChatTools(): vscode.LanguageModelChatTool[] {
   }));
 }
 
+/* ---- conversation history ---- */
+
+/**
+ * Convert prior chat turns into LanguageModelChatMessages so the model
+ * has awareness of the ongoing conversation — including turns handled by
+ * other participants (e.g. default Copilot, @workspace).
+ */
+function buildHistoryMessages(
+  history: ReadonlyArray<vscode.ChatRequestTurn | vscode.ChatResponseTurn>,
+): vscode.LanguageModelChatMessage[] {
+  const msgs: vscode.LanguageModelChatMessage[] = [];
+  let totalChars = 0;
+
+  // Walk history newest-first so we can drop oldest turns when over budget
+  const entries: vscode.LanguageModelChatMessage[] = [];
+  for (const turn of history) {
+    if (turn instanceof vscode.ChatRequestTurn) {
+      const label = turn.participant && turn.participant !== PARTICIPANT_ID
+        ? `[User to @${turn.participant}]: `
+        : '';
+      entries.push(vscode.LanguageModelChatMessage.User(`${label}${turn.prompt}`));
+    } else if (turn instanceof vscode.ChatResponseTurn) {
+      const text = turn.response
+        .filter((p): p is vscode.ChatResponseMarkdownPart => p instanceof vscode.ChatResponseMarkdownPart)
+        .map(p => p.value.value)
+        .join('');
+      if (!text) continue;
+      const label = turn.participant && turn.participant !== PARTICIPANT_ID
+        ? `[@${turn.participant}]: `
+        : '';
+      entries.push(vscode.LanguageModelChatMessage.Assistant(`${label}${text}`));
+    }
+  }
+
+  // Keep most recent turns within budget
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const content = entries[i].content as unknown[];
+    const len = content.reduce((n: number, p: unknown) => {
+      if (p && typeof p === 'object' && 'value' in p) return n + String((p as { value: string }).value).length;
+      return n;
+    }, 0);
+    if (totalChars + len > MAX_HISTORY_CHARS) break;
+    totalChars += len;
+    msgs.unshift(entries[i]);
+  }
+
+  return msgs;
+}
+
 /* ---- agentic tool loop ---- */
 
 async function runAgenticLoop(
   request: vscode.ChatRequest,
+  chatContext: vscode.ChatContext,
   response: vscode.ChatResponseStream,
   token: vscode.CancellationToken,
 ): Promise<vscode.ChatResult> {
   const systemPrompt = buildSystemPrompt();
   const userPrompt = resolveUserPrompt(request);
+  const historyMessages = buildHistoryMessages(chatContext.history);
 
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(systemPrompt),
+    ...historyMessages,
     vscode.LanguageModelChatMessage.User(userPrompt),
   ];
 
@@ -135,8 +188,8 @@ function getFollowups(result: vscode.ChatResult): vscode.ChatFollowup[] {
 /* ---- registration ---- */
 
 export function registerChatParticipant(context: vscode.ExtensionContext): void {
-  const participant = vscode.chat.createChatParticipant(PARTICIPANT_ID, async (request, _context, response, token) => {
-    return runAgenticLoop(request, response, token);
+  const participant = vscode.chat.createChatParticipant(PARTICIPANT_ID, async (request, chatContext, response, token) => {
+    return runAgenticLoop(request, chatContext, response, token);
   });
 
   participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'assets', 'icon.png');
